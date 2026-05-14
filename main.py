@@ -4,9 +4,11 @@ import requests
 import time
 import threading
 import datetime
+import json
+import asyncio
+import websockets
 from flask import Flask
 from binance.client import Client
-from binance import ThreadedWebsocketManager
 
 # --- 1. SETUP & KEEP-ALIVE SERVER ---
 app = Flask('')
@@ -93,7 +95,6 @@ def format_volume(vol_usd):
         return f"${vol_usd:.0f}"
 
 def get_oi_change(symbol):
-    """Fetch Open Interest change from Binance Futures (USDT pairs only)."""
     try:
         url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol.upper()}&period=3m&limit=2"
         data = requests.get(url, timeout=5).json()
@@ -109,32 +110,26 @@ def get_oi_change(symbol):
         pass
     return "N/A", "N/A"
 
-def is_compressed(data, avg_volume, current_volume):
-    """Compression = tight price range AND volume below average."""
+def is_compressed(high, low, close, avg_volume, current_volume):
     try:
-        high  = float(data['k']['h'])
-        low   = float(data['k']['l'])
-        close = float(data['k']['c'])
         price_range_pct = ((high - low) / close) * 100
         return price_range_pct < 0.5 and current_volume < avg_volume
     except Exception:
         return False
 
 # --- 4. THE ANALYTICS ENGINE ---
-def handle_socket_message(msg):
-    if 'data' not in msg:
-        return
-    data = msg['data']
-    if data['e'] != 'kline' or not data['k']['x']:
+def process_kline(symbol, kline):
+    if not kline['x']:  # Only process closed candles
         return
 
-    symbol = data['s'].lower()
+    open_price     = float(kline['o'])
+    close_price    = float(kline['c'])
+    high_price     = float(kline['h'])
+    low_price      = float(kline['l'])
+    current_volume = float(kline['v'])
+
     if symbol not in volume_history:
         return
-
-    open_price     = float(data['k']['o'])
-    close_price    = float(data['k']['c'])
-    current_volume = float(data['k']['v'])
 
     history = volume_history[symbol]
     history.append(current_volume)
@@ -157,9 +152,8 @@ def handle_socket_message(msg):
                     signal_score     = get_signal_score(volume_multiplier, price_change_pct)
                     price_arrow      = "📈" if price_change_pct >= 0 else "📉"
                     change_sign      = "+" if price_change_pct >= 0 else ""
-                    compression      = "Yes" if is_compressed(data, avg_volume, current_volume) else "No"
+                    compression      = "Yes" if is_compressed(high_price, low_price, close_price, avg_volume, current_volume) else "No"
 
-                    # OI only available for USDT futures pairs
                     if symbol.endswith('usdt'):
                         oi_change, oi_trend = get_oi_change(symbol)
                     else:
@@ -186,7 +180,48 @@ def handle_socket_message(msg):
             else:
                 consecutive_spikes[symbol] = 0
 
-# --- 5. LAUNCHER ---
+# --- 5. WEBSOCKET STREAMS ---
+async def stream_chunk(streams):
+    """Connect to a combined stream and process messages."""
+    stream_path = "/".join(streams)
+    url = f"wss://stream.binance.com:9443/stream?streams={stream_path}"
+
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                print(f"Connected to {len(streams)} streams")
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        if 'data' in data and data['data']['e'] == 'kline':
+                            symbol = data['data']['s'].lower()
+                            kline  = data['data']['k']
+                            process_kline(symbol, kline)
+                    except Exception as e:
+                        print(f"Message error: {e}")
+        except Exception as e:
+            print(f"Stream error: {e}. Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
+async def run_all_streams():
+    """Split symbols into chunks and run all streams concurrently."""
+    chunk_size = 200  # Binance allows max 1024 streams per connection
+    stream_list = [f"{s}@kline_3m" for s in symbols]
+    chunks = [stream_list[i:i+chunk_size] for i in range(0, len(stream_list), chunk_size)]
+
+    print(f"Starting {len(chunks)} stream connections for {len(symbols)} pairs...")
+    await asyncio.gather(*[stream_chunk(chunk) for chunk in chunks])
+
+def run_streams_thread():
+    """Run the async event loop in a thread."""
+    while True:
+        try:
+            asyncio.run(run_all_streams())
+        except Exception as e:
+            print(f"Stream thread crashed: {e}. Restarting in 10s...")
+            time.sleep(10)
+
+# --- 6. LAUNCHER ---
 print("Connecting to Binance Public API...")
 client = Client()
 exchange_info = client.get_exchange_info()
@@ -196,38 +231,13 @@ symbols = [s['symbol'].lower() for s in exchange_info['symbols']
 volume_history = {symbol: [] for symbol in symbols}
 consecutive_spikes = {symbol: 0 for symbol in symbols}
 
-def run_binance_streams():
-    while True:
-        twm = None
-        try:
-            print("Starting Binance WebSocket streams...")
-            twm = ThreadedWebsocketManager()
-            twm.start()
-
-            chunk_size = 500
-            for i in range(0, len(symbols), chunk_size):
-                twm.start_multiplex_socket(
-                    callback=handle_socket_message,
-                    streams=[f"{s}@kline_3m" for s in symbols[i:i+chunk_size]]
-                )
-
-            send_telegram_alert(f"🚀 *Bot Online!*\nMonitoring {len(symbols)} pairs.")
-            twm.join()
-
-        except Exception as e:
-            print(f"Binance stream crashed: {e}")
-            send_telegram_alert(f"⚠️ *WebSocket crashed:* {e}\nRestarting in 15s...")
-        finally:
-            if twm:
-                try:
-                    twm.stop()
-                except Exception:
-                    pass
-
-        print("Restarting Binance streams in 15 seconds...")
-        time.sleep(15)
-
 if __name__ == "__main__":
+    send_telegram_alert(f"🚀 *Bot Online!*\nMonitoring {len(symbols)} pairs.")
+
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=telegram_status_listener, daemon=True).start()
-    run_binance_streams()
+    threading.Thread(target=run_streams_thread, daemon=True).start()
+
+    # Keep main thread alive
+    while True:
+        time.sleep(60)
